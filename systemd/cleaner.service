@@ -1,0 +1,9 @@
+[Unit]
+Description=Cleaner - rituel quotidien de tri des images
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=%t
+ExecStart=/usr/local/bin/cleaner --scheduled

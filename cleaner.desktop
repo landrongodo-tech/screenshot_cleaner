@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Cleaner
+Comment=Rituel quotidien de tri des images
+Exec=/usr/local/bin/cleaner
+TryExec=/usr/local/bin/cleaner
+Icon=folder-pictures
+Terminal=false
+Categories=Graphics;
+StartupNotify=true
