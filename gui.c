@@ -42,6 +42,7 @@ struct AppState {
     struct Image *courante;
     gboolean premier_lancement;
     gboolean choisir_dossier_initial;
+    gboolean synchronisation_systemd_en_cours;
 };
 
 enum {
@@ -418,6 +419,248 @@ static void afficher_erreur(GtkWindow *parent, const char *titre,
     gtk_widget_destroy(dialogue);
 }
 
+static gboolean executer_commande_systemd(const char *const arguments[],
+                                          GError **erreur)
+{
+    GSubprocess *processus = g_subprocess_newv(
+        arguments, G_SUBPROCESS_FLAGS_STDOUT_PIPE
+                       | G_SUBPROCESS_FLAGS_STDERR_PIPE,
+        erreur);
+    if (processus == NULL) {
+        return FALSE;
+    }
+
+    char *sortie = NULL;
+    char *diagnostic = NULL;
+    const gboolean communique = g_subprocess_communicate_utf8(
+        processus, NULL, NULL, &sortie, &diagnostic, erreur);
+    if (!communique) {
+        g_free(sortie);
+        g_free(diagnostic);
+        g_object_unref(processus);
+        return FALSE;
+    }
+
+    if (!g_subprocess_get_successful(processus)) {
+        g_set_error(erreur, G_IO_ERROR, G_IO_ERROR_FAILED,
+                    "La commande systemd a échoué : %s",
+                    diagnostic != NULL && diagnostic[0] != '\0'
+                        ? diagnostic
+                        : "aucun détail fourni");
+        g_free(sortie);
+        g_free(diagnostic);
+        g_object_unref(processus);
+        return FALSE;
+    }
+
+    g_free(sortie);
+    g_free(diagnostic);
+    g_object_unref(processus);
+    return TRUE;
+}
+
+static char *chemin_exec_systemd(const char *chemin)
+{
+    GString *resultat = g_string_new("\"");
+    for (const char *caractere = chemin; *caractere != '\0'; ++caractere) {
+        switch (*caractere) {
+        case '\\':
+            g_string_append(resultat, "\\\\");
+            break;
+        case '"':
+            g_string_append(resultat, "\\\"");
+            break;
+        case '$':
+            g_string_append(resultat, "$$");
+            break;
+        case '%':
+            g_string_append(resultat, "%%");
+            break;
+        case '\n':
+            g_string_append(resultat, "\\n");
+            break;
+        case '\r':
+            g_string_append(resultat, "\\r");
+            break;
+        case '\t':
+            g_string_append(resultat, "\\t");
+            break;
+        default:
+            g_string_append_c(resultat, *caractere);
+            break;
+        }
+    }
+    return g_string_append_c(resultat, '"')->str;
+}
+
+/*
+ * Le service hérite de l'environnement graphique importé dans le gestionnaire
+ * systemd utilisateur. Le timer garde sa vérification par minute : l'heure
+ * effective et les reports restent pilotés par config.conf.
+ */
+static gboolean synchroniser_timer_utilisateur(GError **erreur)
+{
+    const char *repertoire_configuration = g_get_user_config_dir();
+    char *repertoire_unites = g_build_filename(
+        repertoire_configuration, "systemd", "user", NULL);
+    if (repertoire_unites == NULL
+        || g_mkdir_with_parents(repertoire_unites, 0700) == -1) {
+        const int erreur_systeme = errno;
+        g_set_error(erreur, G_FILE_ERROR,
+                    g_file_error_from_errno(erreur_systeme),
+                    "Impossible de créer le répertoire des unités systemd : %s",
+                    g_strerror(erreur_systeme));
+        g_free(repertoire_unites);
+        return FALSE;
+    }
+
+    char *chemin_service = g_build_filename(
+        repertoire_unites, "cleaner.service", NULL);
+    char *chemin_timer = g_build_filename(
+        repertoire_unites, "cleaner.timer", NULL);
+    char *chemin_binaire = g_file_read_link("/proc/self/exe", erreur);
+    if (chemin_service == NULL || chemin_timer == NULL
+        || chemin_binaire == NULL) {
+        if (erreur != NULL && *erreur == NULL) {
+            g_set_error_literal(erreur, G_FILE_ERROR, G_FILE_ERROR_NOMEM,
+                                "Mémoire insuffisante pour préparer systemd.");
+        }
+        g_free(chemin_binaire);
+        g_free(chemin_service);
+        g_free(chemin_timer);
+        g_free(repertoire_unites);
+        return FALSE;
+    }
+
+    char *chemin_binaire_echappe = chemin_exec_systemd(chemin_binaire);
+    char *contenu_service = g_strdup_printf(
+        "[Unit]\n"
+        "Description=Cleaner - rituel quotidien de tri des images\n"
+        "After=graphical-session.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        "ExecStart=%s --scheduled\n",
+        chemin_binaire_echappe);
+    const char *contenu_timer =
+        "[Unit]\n"
+        "Description=Vérification périodique de l'heure du rituel Cleaner\n"
+        "\n"
+        "[Timer]\n"
+        "OnCalendar=*-*-* *:*:00\n"
+        "AccuracySec=1s\n"
+        "Persistent=true\n"
+        "Unit=cleaner.service\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n";
+
+    gboolean resultat = contenu_service != NULL
+        && g_file_set_contents(chemin_service, contenu_service, -1, erreur);
+    if (contenu_service == NULL && erreur != NULL && *erreur == NULL) {
+        g_set_error_literal(erreur, G_FILE_ERROR, G_FILE_ERROR_NOMEM,
+                            "Mémoire insuffisante pour préparer systemd.");
+        resultat = FALSE;
+    }
+    if (resultat && g_chmod(chemin_service, 0644) == -1) {
+        const int erreur_systeme = errno;
+        g_set_error(erreur, G_FILE_ERROR,
+                    g_file_error_from_errno(erreur_systeme),
+                    "Impossible de protéger %s : %s",
+                    chemin_service, g_strerror(erreur_systeme));
+        resultat = FALSE;
+    }
+    if (resultat) {
+        resultat = g_file_set_contents(
+            chemin_timer, contenu_timer, -1, erreur);
+    }
+    if (resultat && g_chmod(chemin_timer, 0644) == -1) {
+        const int erreur_systeme = errno;
+        g_set_error(erreur, G_FILE_ERROR,
+                    g_file_error_from_errno(erreur_systeme),
+                    "Impossible de protéger %s : %s",
+                    chemin_timer, g_strerror(erreur_systeme));
+        resultat = FALSE;
+    }
+
+    g_free(chemin_service);
+    g_free(chemin_timer);
+    g_free(chemin_binaire);
+    g_free(chemin_binaire_echappe);
+    g_free(contenu_service);
+    g_free(repertoire_unites);
+    if (!resultat) {
+        return FALSE;
+    }
+
+    static const char *const importer_environnement[] = {
+        "systemctl", "--user", "import-environment",
+        "HOME", "XDG_CONFIG_HOME", "DISPLAY", "WAYLAND_DISPLAY",
+        "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", NULL
+    };
+    static const char *const recharger[] = {
+        "systemctl", "--user", "daemon-reload", NULL
+    };
+    static const char *const activer[] = {
+        "systemctl", "--user", "enable", "--now", "cleaner.timer", NULL
+    };
+    static const char *const redemarrer[] = {
+        "systemctl", "--user", "restart", "cleaner.timer", NULL
+    };
+
+    return executer_commande_systemd(importer_environnement, erreur)
+        && executer_commande_systemd(recharger, erreur)
+        && executer_commande_systemd(activer, erreur)
+        && executer_commande_systemd(redemarrer, erreur);
+}
+
+static void synchroniser_timer_en_arriere_plan(
+    GTask *tache, gpointer source, gpointer donnees,
+    GCancellable *annulation)
+{
+    (void)source;
+    (void)donnees;
+    (void)annulation;
+    GError *erreur = NULL;
+    if (synchroniser_timer_utilisateur(&erreur)) {
+        g_task_return_boolean(tache, TRUE);
+    } else {
+        g_task_return_error(tache, erreur);
+    }
+}
+
+static void synchronisation_timer_terminee(GObject *source,
+                                           GAsyncResult *resultat,
+                                           gpointer donnees)
+{
+    struct AppState *etat = donnees;
+    GError *erreur = NULL;
+    (void)source;
+
+    etat->synchronisation_systemd_en_cours = FALSE;
+    if (!g_task_propagate_boolean(G_TASK(resultat), &erreur)) {
+        afficher_erreur(
+            etat->fenetre != NULL ? GTK_WINDOW(etat->fenetre) : NULL,
+            "Réglages enregistrés, automatisation indisponible",
+            erreur->message);
+        g_clear_error(&erreur);
+    }
+    g_application_release(G_APPLICATION(etat->application));
+}
+
+static void lancer_synchronisation_timer(struct AppState *etat)
+{
+    if (etat->synchronisation_systemd_en_cours) {
+        return;
+    }
+
+    etat->synchronisation_systemd_en_cours = TRUE;
+    g_application_hold(G_APPLICATION(etat->application));
+    GTask *tache = g_task_new(NULL, NULL, synchronisation_timer_terminee, etat);
+    g_task_run_in_thread(tache, synchroniser_timer_en_arriere_plan);
+    g_object_unref(tache);
+}
+
 struct ChoixDossierReglages {
     GtkWindow *parent;
     GtkWidget *affichage;
@@ -678,6 +921,8 @@ static gboolean dialoguer_reglages(struct AppState *etat, gboolean premier)
     g_free(etat->date_compteur);
     etat->date_compteur = aujourd_hui;
     etat->choisir_dossier_initial = FALSE;
+
+    lancer_synchronisation_timer(etat);
     return TRUE;
 }
 

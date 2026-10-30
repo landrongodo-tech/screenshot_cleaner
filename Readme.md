@@ -93,81 +93,33 @@ remplacé par un message, mais les actions Garder et Supprimer restent proposée
 
 ## Lancement automatique à l'heure du rituel
 
-L'installation fournit un service systemd utilisateur et un timer d'exemple
-(`cleaner.service` et `cleaner.timer`). Activez le timer une seule fois :
-
-```sh
-systemctl --user daemon-reload
-systemctl --user enable --now cleaner.timer
-systemctl --user list-timers cleaner.timer
-```
+L'automatisation est initialisée automatiquement lorsque l'utilisateur valide
+les réglages dans la fenêtre. Cleaner enregistre d'abord ses préférences, puis
+crée ou met à jour `cleaner.service` et `cleaner.timer` dans le répertoire
+systemd utilisateur, importe l'environnement graphique courant et demande à
+systemd de recharger et d'activer le timer. Aucun passage par le terminal n'est
+nécessaire. Si systemd ne peut pas appliquer l'automatisation, Cleaner affiche
+une erreur ; les préférences restent enregistrées.
 
 Le timer vérifie l'heure configurée chaque minute. Le service appelle
-`cleaner --scheduled` : le programme lit les préférences de l'utilisateur et
-n'ouvre GTK qu'à l'heure locale enregistrée dans **Réglages**. Après une
-modification de l'heure, aucune édition du fichier systemd n'est nécessaire.
-Avant le premier lancement interactif, le timer n'ouvre pas l'assistant ; lancez
-`cleaner` une fois pour initialiser l'heure et le quota.
-
-Sur une session de bureau GNOME, le service doit hériter de l'environnement
-graphique. En général, GNOME le publie déjà au gestionnaire systemd utilisateur.
-Pour installer une copie personnelle de l'unité dans
-`~/.config/systemd/user/cleaner.service`, copiez l'unité fournie après avoir
-installé Cleaner. `XDG_RUNTIME_DIR=%t` est résolu par systemd vers le répertoire
-runtime du compte ; `DISPLAY=:0` est un exemple X11 et doit correspondre à
-l'affichage réellement utilisé :
-
-```ini
-[Unit]
-Description=Cleaner - rituel quotidien de tri des images
-After=graphical-session.target
-
-[Service]
-Type=oneshot
-Environment=DISPLAY=:0
-Environment=XDG_RUNTIME_DIR=%t
-ExecStart=/usr/local/bin/cleaner --scheduled
-```
-
-Le chemin de `ExecStart` doit désigner le binaire installé. Pour laisser le
-gestionnaire systemd utilisateur transmettre l'environnement exact de la session
-(recommandé en particulier sous Wayland), ouvrez un terminal dans la session
-graphique et importez ses variables :
-
-```sh
-systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY \
-    DBUS_SESSION_BUS_ADDRESS
-```
-
-Copiez aussi le timer dans le répertoire utilisateur puis rechargez les unités :
-
-```sh
-install -Dm 0644 systemd/cleaner.service \
-    "$HOME/.config/systemd/user/cleaner.service"
-install -Dm 0644 systemd/cleaner.timer \
-    "$HOME/.config/systemd/user/cleaner.timer"
-systemctl --user daemon-reload
-systemctl --user enable --now cleaner.timer
-```
-
-La copie sous `~/.config/systemd/user` prend priorité sur une unité installée
-sous `/usr/local/lib/systemd/user` ; gardez les deux copies synchronisées si
-vous utilisez cette installation personnelle.
-`DISPLAY=:0` n'est pas universel : vérifiez la valeur avec `printf '%s\n' "$DISPLAY"`
-dans la session graphique et adaptez l'unité, ou laissez systemd hériter de la
-valeur importée.
+`cleaner --scheduled`, qui lit l'heure et le report enregistrés dans
+`config.conf` et n'ouvre GTK que lorsque le rituel est dû. Cette vérification
+par minute permet également de respecter les reports de quelques minutes.
+Modifier l'heure dans **Réglages** ne nécessite donc pas de réécrire une
+planification quotidienne : la nouvelle préférence est utilisée par le prochain
+contrôle.
 
 Le compte utilisateur doit être connecté à sa session graphique à l'heure du
-timer ; ce n'est pas un service système destiné à ouvrir une session graphique
-depuis un écran de connexion. `Persistent=true` demande à systemd de rattraper
+timer ; il ne s'agit pas d'un service système destiné à ouvrir une session
+graphique depuis un écran de connexion. Avant le premier lancement interactif,
+le timer n'ouvre pas l'assistant : il faut d'abord lancer Cleaner et enregistrer
+les réglages dans la fenêtre. `Persistent=true` demande à systemd de rattraper
 un déclenchement manqué (l'application peut donc s'ouvrir à la connexion
-suivante). Pour contrôler les erreurs :
+suivante).
+
+Pour diagnostiquer une erreur, les journaux utilisateur systemd contiennent le
+détail du service :
 
 ```sh
 journalctl --user -u cleaner.service
 ```
-
-Systemd déclenche un contrôle bref chaque minute ; c'est la préférence persistée
-dans Cleaner qui décide quand ouvrir l'interface. L'application doit donc être
-installée et le timer utilisateur activé pour bénéficier du lancement
-automatique.
